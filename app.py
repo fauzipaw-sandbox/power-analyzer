@@ -23,7 +23,7 @@ def get_db_client() -> Client:
 
 db = get_db_client()
 
-st.title("⚡ BBU Voltage Monitoring & Trend Analysis")
+st.title("⚡ BBU Voltage Monitoring & Analysis")
 
 # ================= SIDEBAR: OTOMATIS MULTI-UPLOAD =================
 st.sidebar.header("📥 Ingest Data PM")
@@ -59,7 +59,7 @@ if new_files_to_process:
             try:
                 df_raw = pd.read_excel(current_file, engine="openpyxl")
 
-                # 1. Deteksi dinamis kolom waktu, ME, dan voltage
+                # 1. Deteksi dinamis nama kolom waktu, ME, dan voltage
                 time_col = None
                 me_col = None
                 min_col = None
@@ -165,7 +165,7 @@ threshold_voltage = st.sidebar.number_input(
     "Batas Voltage Drop (V):", 
     min_value=30.0, 
     max_value=60.0, 
-    value=47.0, 
+    value=42.0, 
     step=0.5
 )
 
@@ -187,14 +187,14 @@ except Exception as e:
     st.error(f"Gagal membaca data dari server: {str(e)}")
     all_raw_data = []
 
-# ================= FILTERING PADA DATAFRAME =================
+# ================= FILTERING & PERHITUNGAN FREKUENSI =================
 if not all_raw_data:
     st.info("Database masih kosong. Silakan unggah file Excel PM pada panel sebelah kiri.")
 else:
     df_all = pd.DataFrame(all_raw_data)
     df_all["begin_time"] = pd.to_datetime(df_all["begin_time"])
 
-    # Filter rentang jam mundur dari timestamp data paling akhir
+    # Cutoff waktu mundur jika filter jam aktif
     cutoff_iso = None
     if duration_hours is not None and not df_all.empty:
         max_time = df_all["begin_time"].max()
@@ -204,193 +204,214 @@ else:
     else:
         df_filtered_view = df_all
 
-    # Filter drop voltage (hanya baris dengan nilai valid)
-    df_valid_voltage = df_filtered_view.dropna(subset=["min_voltage"])
-    df_dropped = df_valid_voltage[df_valid_voltage["min_voltage"] < threshold_voltage]
+    # Filter khusus data numerik valid yang berada DI BAWAH batas voltage
+    df_valid = df_filtered_view.dropna(subset=["min_voltage"]).copy()
+    df_dropped = df_valid[df_valid["min_voltage"] < threshold_voltage]
 
     # Metrics Ringkasan
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Batas Voltage", f"< {threshold_voltage} V")
     col2.metric("Rentang Waktu", f"{duration_hours} Jam Terakhir" if duration_hours else "Semua Data")
     col3.metric("Site Terdampak Drop", f"{df_dropped['managed_element'].nunique()} Site")
-    col4.metric("Total Kejadian Drop", f"{len(df_dropped)} Sampel")
+    col4.metric("Total Sampel Drop", f"{len(df_dropped)} Kali")
 
     st.markdown("---")
 
-    # Tab Visualisasi
-    tab1, tab2 = st.tabs(["📊 Ranking Drop Voltage", "📈 Grafik Tren Voltage (15 Menit)"])
+    # ================= TABEL DAFTAR SITE TERDAMPAK =================
+    st.subheader(f"Daftar Site Terdampak Voltage < {threshold_voltage} V")
 
-    with tab1:
-        if not df_dropped.empty:
-            summary = (
-                df_dropped.groupby("managed_element")
-                .agg(
-                    total_drop=("min_voltage", "count"),
-                    min_v_recorded=("min_voltage", "min"),
-                    avg_v_recorded=("avg_voltage", "mean")
-                )
-                .reset_index()
-                .sort_values(by=["total_drop", "min_v_recorded"], ascending=[False, True])
+    selected_site = None
+
+    if not df_dropped.empty:
+        # Hitung frekuensi drop (berapa kali min_voltage < threshold_voltage)
+        summary = (
+            df_dropped.groupby("managed_element")
+            .agg(
+                frekuensi_drop=("min_voltage", "count"),
+                min_v_recorded=("min_voltage", "min"),
+                avg_v_recorded=("avg_voltage", "mean")
+            )
+            .reset_index()
+            .sort_values(by=["frekuensi_drop", "min_v_recorded"], ascending=[False, True])
+            .rename(columns={
+                "managed_element": "Managed Element (Site)",
+                "frekuensi_drop": "Frekuensi Drop",
+                "min_v_recorded": "Voltage Terendah (V)",
+                "avg_v_recorded": "Rata-rata Voltage (V)"
+            })
+        )
+        
+        summary["Voltage Terendah (V)"] = summary["Voltage Terendah (V)"].round(3)
+        summary["Rata-rata Voltage (V)"] = summary["Rata-rata Voltage (V)"].round(3)
+
+        st.caption("👉 **Klik pada baris salah satu site** di tabel untuk langsung melihat grafik tren voltasenya di bawah.")
+
+        # Tabel interaktif dengan deteksi event klik baris
+        selection_event = st.dataframe(
+            summary,
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row"
+        )
+
+        # Ambil site yang diklik pengguna
+        if selection_event and selection_event.selection and selection_event.selection.rows:
+            selected_row_idx = selection_event.selection.rows[0]
+            selected_site = summary.iloc[selected_row_idx]["Managed Element (Site)"]
+        else:
+            # Default ke site urutan pertama dengan drop tertinggi
+            selected_site = summary.iloc[0]["Managed Element (Site)"]
+
+        with st.expander("🔍 Lihat Rincian Log Kejadian Drop (Data Mentah)"):
+            df_detail = df_dropped.copy().sort_values(by="begin_time", ascending=False)
+            df_detail["Waktu (Lokal)"] = df_detail["begin_time"].dt.strftime("%Y-%m-%d %H:%M")
+            st.dataframe(
+                df_detail[["Waktu (Lokal)", "managed_element", "min_voltage", "avg_voltage", "max_voltage"]]
                 .rename(columns={
-                    "managed_element": "Managed Element (Site)",
-                    "total_drop": "Frekuensi Drop (< Batas)",
-                    "min_v_recorded": "Voltage Terendah (V)",
-                    "avg_v_recorded": "Rata-rata Voltage (V)"
-                })
+                    "managed_element": "Site Name",
+                    "min_voltage": "Min Voltage (V)",
+                    "avg_voltage": "Avg Voltage (V)",
+                    "max_voltage": "Max Voltage (V)"
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+    else:
+        st.success(f"Kondisi optimal. Tidak ditemukan site dengan voltage di bawah {threshold_voltage} V.")
+
+    # ================= GRAFIK TREN (LANGSUNG MUNCUL DI BAWAH TABEL) =================
+    st.markdown("---")
+    
+    # Dropdown alternatif jika user ingin memilih site di luar daftar drop
+    col_header, col_interval = st.columns([3, 1])
+    with col_header:
+        all_sites = sorted(df_all["managed_element"].unique().tolist())
+        default_index = all_sites.index(selected_site) if selected_site in all_sites else 0
+        active_site = st.selectbox(
+            "Site yang sedang dianalisis grafiknya:",
+            options=all_sites,
+            index=default_index,
+            help="Bisa dipilih manual atau otomatis berubah saat baris tabel di atas diklik."
+        )
+    with col_interval:
+        chart_interval = st.selectbox("Interval Grafik:", options=["15 Menit", "1 Jam", "Data Asli"])
+
+    if active_site:
+        with st.spinner(f"Memuat histori tegangan untuk {active_site}..."):
+            query_site = (
+                db.table("bbu_voltage")
+                .select("begin_time, min_voltage, avg_voltage, max_voltage")
+                .eq("managed_element", active_site)
+                .order("begin_time", desc=False)
             )
             
-            summary["Voltage Terendah (V)"] = summary["Voltage Terendah (V)"].round(3)
-            summary["Rata-rata Voltage (V)"] = summary["Rata-rata Voltage (V)"].round(3)
+            if cutoff_iso is not None:
+                query_site = query_site.gte("begin_time", cutoff_iso)
+            
+            res_site = query_site.execute()
+            site_data = res_site.data
 
-            st.subheader(f"Daftar Site Terdampak Voltage < {threshold_voltage} V")
-            st.dataframe(summary, use_container_width=True, hide_index=True)
+        if site_data and len(site_data) > 0:
+            df_site = pd.DataFrame(site_data)
+            df_site["begin_time"] = pd.to_datetime(df_site["begin_time"])
+            df_site = df_site.set_index("begin_time").sort_index()
 
-            with st.expander("🔍 Lihat Rincian Log (Data Mentah)"):
-                df_detail = df_dropped.copy().sort_values(by="begin_time", ascending=False)
-                df_detail["Waktu (Lokal)"] = df_detail["begin_time"].dt.strftime("%Y-%m-%d %H:%M")
-                st.dataframe(
-                    df_detail[["Waktu (Lokal)", "managed_element", "min_voltage", "avg_voltage", "max_voltage"]]
-                    .rename(columns={
-                        "managed_element": "Site Name",
-                        "min_voltage": "Min Voltage (V)",
-                        "avg_voltage": "Avg Voltage (V)",
-                        "max_voltage": "Max Voltage (V)"
-                    }),
-                    use_container_width=True,
-                    hide_index=True
-                )
-        else:
-            st.success(f"Kondisi optimal. Tidak ditemukan site dengan voltage di bawah {threshold_voltage} V.")
-
-    with tab2:
-        st.subheader("Grafik Pergerakan Voltage")
-        
-        # Susun daftar site dengan memprioritaskan yang mengalami drop
-        dropped_sites = sorted(df_dropped["managed_element"].unique().tolist()) if not df_dropped.empty else []
-        all_sites = sorted(df_all["managed_element"].unique().tolist())
-        site_list = dropped_sites + [s for s in all_sites if s not in dropped_sites]
-
-        col_select_site, col_select_res = st.columns([3, 1])
-        with col_select_site:
-            selected_site = st.selectbox("Pilih Site / Managed Element:", options=site_list)
-        with col_select_res:
-            chart_interval = st.selectbox("Interval Waktu:", options=["15 Menit", "1 Jam", "Data Asli"])
-
-        if selected_site:
-            with st.spinner(f"Memuat histori lengkap untuk {selected_site}..."):
-                query_site = (
-                    db.table("bbu_voltage")
-                    .select("begin_time, min_voltage, avg_voltage, max_voltage")
-                    .eq("managed_element", selected_site)
-                    .order("begin_time", desc=False)
-                )
-                
-                if cutoff_iso is not None:
-                    query_site = query_site.gte("begin_time", cutoff_iso)
-                
-                res_site = query_site.execute()
-                site_data = res_site.data
-
-            if site_data and len(site_data) > 0:
-                df_site = pd.DataFrame(site_data)
-                df_site["begin_time"] = pd.to_datetime(df_site["begin_time"])
-                df_site = df_site.set_index("begin_time").sort_index()
-
-                # RESAMPLE DENGAN TETAP MENJAGA NaN (AGAR WAKTU KOSONG TIDAK TERSAMBUNG)
-                if chart_interval == "15 Menit":
-                    chart_df = df_site.resample("15min").agg({
-                        "min_voltage": "min",
-                        "avg_voltage": "mean",
-                        "max_voltage": "max"
-                    })
-                elif chart_interval == "1 Jam":
-                    chart_df = df_site.resample("1h").agg({
-                        "min_voltage": "min",
-                        "avg_voltage": "mean",
-                        "max_voltage": "max"
-                    })
-                else:
-                    chart_df = df_site[["min_voltage", "avg_voltage", "max_voltage"]].copy()
-
-                # Hitung batas Y dinamis agar grafik tidak flat dari 0
-                val_min = chart_df["min_voltage"].min()
-                val_max = chart_df["max_voltage"].max()
-                
-                if pd.notna(val_min) and pd.notna(val_max):
-                    span = max(val_max - val_min, 2.0)
-                    y_bottom = max(0.0, float(val_min) - span * 0.15)
-                    y_top = float(val_max) + span * 0.15
-                    y_bottom = min(y_bottom, float(threshold_voltage) - 1.0)
-                else:
-                    y_bottom, y_top = 40.0, 56.0
-
-                fig = go.Figure()
-
-                # Min Voltage (connectgaps=False agar periode kosong terputus)
-                fig.add_trace(go.Scatter(
-                    x=chart_df.index,
-                    y=chart_df["min_voltage"],
-                    mode="lines+markers",
-                    name="Min Voltage (V)",
-                    connectgaps=False,
-                    line=dict(color="#EF4444", width=2),
-                    marker=dict(size=4)
-                ))
-
-                # Avg Voltage (connectgaps=False)
-                fig.add_trace(go.Scatter(
-                    x=chart_df.index,
-                    y=chart_df["avg_voltage"],
-                    mode="lines+markers",
-                    name="Avg Voltage (V)",
-                    connectgaps=False,
-                    line=dict(color="#3B82F6", width=2),
-                    marker=dict(size=4)
-                ))
-
-                # Max Voltage (connectgaps=False)
-                fig.add_trace(go.Scatter(
-                    x=chart_df.index,
-                    y=chart_df["max_voltage"],
-                    mode="lines+markers",
-                    name="Max Voltage (V)",
-                    connectgaps=False,
-                    line=dict(color="#10B981", width=2),
-                    marker=dict(size=4)
-                ))
-
-                # Garis Batas Ambang (Threshold)
-                fig.add_hline(
-                    y=threshold_voltage,
-                    line_dash="dash",
-                    line_color="#DC2626",
-                    annotation_text=f"Batas Ambang ({threshold_voltage} V)",
-                    annotation_position="bottom right"
-                )
-
-                fig.update_layout(
-                    title=f"Tren Tegangan BBU - {selected_site}",
-                    xaxis_title="Waktu",
-                    yaxis_title="Voltage (V)",
-                    yaxis=dict(range=[y_bottom, y_top]),
-                    hovermode="x unified",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                    margin=dict(l=20, r=20, t=50, b=20),
-                    template="plotly_dark"
-                )
-
-                st.plotly_chart(fig, use_container_width=True)
-                valid_points = chart_df["min_voltage"].dropna().count()
-                st.caption(f"Menampilkan {valid_points} titik data valid untuk {selected_site}. Garis terputus otomatis pada jam yang tidak memiliki rekaman data.")
-
-                # Ringkasan statistik site
-                s_min = df_site["min_voltage"].min()
-                s_avg = df_site["avg_voltage"].mean()
-                s_max = df_site["max_voltage"].max()
-                
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Min Terendah", f"{s_min:.2f} V" if pd.notna(s_min) else "-")
-                c2.metric("Rata-rata Tegangan", f"{s_avg:.2f} V" if pd.notna(s_avg) else "-")
-                c3.metric("Max Tertinggi", f"{s_max:.2f} V" if pd.notna(s_max) else "-")
+            # Resample dengan menjaga NaN agar bagian waktu tanpa data putus/kosong
+            if chart_interval == "15 Menit":
+                chart_df = df_site.resample("15min").agg({
+                    "min_voltage": "min",
+                    "avg_voltage": "mean",
+                    "max_voltage": "max"
+                })
+            elif chart_interval == "1 Jam":
+                chart_df = df_site.resample("1h").agg({
+                    "min_voltage": "min",
+                    "avg_voltage": "mean",
+                    "max_voltage": "max"
+                })
             else:
-                st.warning(f"Belum ada riwayat data tersimpan untuk {selected_site}.")
+                chart_df = df_site[["min_voltage", "avg_voltage", "max_voltage"]].copy()
+
+            # Rentang sumbu Y dinamis
+            val_min = chart_df["min_voltage"].min()
+            val_max = chart_df["max_voltage"].max()
+            
+            if pd.notna(val_min) and pd.notna(val_max):
+                span = max(val_max - val_min, 2.0)
+                y_bottom = max(0.0, float(val_min) - span * 0.15)
+                y_top = float(val_max) + span * 0.15
+                y_bottom = min(y_bottom, float(threshold_voltage) - 1.0)
+            else:
+                y_bottom, y_top = 35.0, 56.0
+
+            fig = go.Figure()
+
+            # Min Voltage (connectgaps=False agar jam tanpa data tidak disambung)
+            fig.add_trace(go.Scatter(
+                x=chart_df.index,
+                y=chart_df["min_voltage"],
+                mode="lines+markers",
+                name="Min Voltage (V)",
+                connectgaps=False,
+                line=dict(color="#EF4444", width=2),
+                marker=dict(size=4)
+            ))
+
+            # Avg Voltage
+            fig.add_trace(go.Scatter(
+                x=chart_df.index,
+                y=chart_df["avg_voltage"],
+                mode="lines+markers",
+                name="Avg Voltage (V)",
+                connectgaps=False,
+                line=dict(color="#3B82F6", width=2),
+                marker=dict(size=4)
+            ))
+
+            # Max Voltage
+            fig.add_trace(go.Scatter(
+                x=chart_df.index,
+                y=chart_df["max_voltage"],
+                mode="lines+markers",
+                name="Max Voltage (V)",
+                connectgaps=False,
+                line=dict(color="#10B981", width=2),
+                marker=dict(size=4)
+            ))
+
+            # Garis Batas Ambang Threshold
+            fig.add_hline(
+                y=threshold_voltage,
+                line_dash="dash",
+                line_color="#DC2626",
+                annotation_text=f"Threshold ({threshold_voltage} V)",
+                annotation_position="bottom right"
+            )
+
+            fig.update_layout(
+                title=f"Tren Pergerakan Voltage BBU - {active_site}",
+                xaxis_title="Waktu",
+                yaxis_title="Voltage (V)",
+                yaxis=dict(range=[y_bottom, y_top]),
+                hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                margin=dict(l=20, r=20, t=50, b=20),
+                template="plotly_dark"
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            # Statistik Cepat Site
+            c1, c2, c3, c4 = st.columns(4)
+            s_min = df_site["min_voltage"].min()
+            s_avg = df_site["avg_voltage"].mean()
+            s_max = df_site["max_voltage"].max()
+            site_drop_count = (df_site["min_voltage"] < threshold_voltage).sum()
+
+            c1.metric("Min Terendah", f"{s_min:.2f} V" if pd.notna(s_min) else "-")
+            c2.metric("Rata-rata Tegangan", f"{s_avg:.2f} V" if pd.notna(s_avg) else "-")
+            c3.metric("Max Tertinggi", f"{s_max:.2f} V" if pd.notna(s_max) else "-")
+            c4.metric(f"Frekuensi Drop (< {threshold_voltage}V)", f"{site_drop_count} Kali")
+        else:
+            st.warning(f"Belum ada riwayat rekaman data untuk {active_site}.")
