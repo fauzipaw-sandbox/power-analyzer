@@ -47,6 +47,25 @@ def parse_voltage(val):
     except:
         return None
 
+def cleanup_old_records(retention_days: int = 30):
+    """Menghapus otomatis data yang lebih lama dari 30 hari berdasarkan timestamp data terakhir."""
+    try:
+        latest_res = (
+            db.table("bbu_voltage")
+            .select("begin_time")
+            .order("begin_time", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if latest_res.data:
+            latest_time = pd.to_datetime(latest_res.data[0]["begin_time"])
+            cutoff_cleanup = (latest_time - timedelta(days=retention_days)).isoformat()
+            
+            # Hapus data yang usianya melebihi 30 hari mundur dari data terbaru
+            db.table("bbu_voltage").delete().lt("begin_time", cutoff_cleanup).execute()
+    except Exception as e:
+        print(f"Warning: Cleanup database gagal - {str(e)}")
+
 new_files_to_process = [
     f for f in (uploaded_files or []) 
     if f.name not in st.session_state.processed_file_names
@@ -80,7 +99,7 @@ if new_files_to_process:
                     elif "max" in c and ("volt" in c or "v" in c):
                         max_col = col
 
-                # Fallback jika hanya ada satu kolom 'voltage'
+                # Fallback jika hanya ada satu kolom 'voltage' generik
                 if not min_col:
                     for col in df_raw.columns:
                         if "volt" in str(col).lower():
@@ -139,7 +158,9 @@ if new_files_to_process:
                 st.sidebar.error(f"Error memproses {current_file.name}: {str(e)}")
 
         if total_saved_all_files > 0:
-            st.sidebar.success(f"Berhasil menyimpan {total_saved_all_files} baris data!")
+            # Otomatis hapus data di atas 30 hari (Opsi 1)
+            cleanup_old_records(retention_days=30)
+            st.sidebar.success(f"Berhasil menyimpan {total_saved_all_files} baris data (Data di atas 30 hari otomatis dibersihkan)!")
             st.cache_data.clear()
             st.rerun()
 
@@ -147,16 +168,17 @@ st.sidebar.markdown("---")
 
 # ================= SIDEBAR: PARAMETER FILTER =================
 st.sidebar.header("⚙️ Parameter Filter")
-filter_mode = st.sidebar.radio("Mode Rentang Waktu:", ["Berdasarkan Data Terakhir", "Semua Data"])
+filter_mode = st.sidebar.radio("Mode Rentang Waktu:", ["Berdasarkan Data Terakhir", "Semua Data (Maks 30 Hari)"])
 
 if filter_mode == "Berdasarkan Data Terakhir":
+    # Slider kustom hingga 720 Jam (30 Hari)
     duration_hours = st.sidebar.slider(
         "Rentang Waktu Terakhir (Jam):",
         min_value=1,
-        max_value=72,
+        max_value=720,
         value=24,
         step=1,
-        help="Geser untuk menentukan durasi mundur dari timestamp data paling akhir"
+        help="Bisa diatur dari 1 jam hingga 720 jam (30 hari mundur dari timestamp data terakhir)"
     )
 else:
     duration_hours = None
@@ -169,13 +191,13 @@ threshold_voltage = st.sidebar.number_input(
     step=0.5
 )
 
-# ================= AUTO LOAD SEMUA DATA DENGAN PAGINATION (BYPASS 1000 ROW LIMIT) =================
+# ================= AUTO LOAD DATA DENGAN PAGINATION =================
 @st.cache_data(ttl=30)
 def load_voltage_overview_paginated():
     all_rows = []
     chunk_size = 1000
     current_start = 0
-    max_total_limit = 100000  # Kuota aman hingga 100.000 baris
+    max_total_limit = 100000
 
     while current_start < max_total_limit:
         res = (
@@ -196,7 +218,7 @@ def load_voltage_overview_paginated():
     return all_rows
 
 try:
-    with st.spinner("Mengambil seluruh data site dari database..."):
+    with st.spinner("Mengambil data site dari database..."):
         all_raw_data = load_voltage_overview_paginated()
 except Exception as e:
     st.error(f"Gagal membaca data dari server: {str(e)}")
@@ -259,9 +281,9 @@ else:
         summary["Voltage Terendah (V)"] = summary["Voltage Terendah (V)"].round(3)
         summary["Rata-rata Voltage (V)"] = summary["Rata-rata Voltage (V)"].round(3)
 
-        st.caption("👉 **Klik salah satu baris site** pada tabel di bawah untuk melihat tren tegangannya.")
+        st.caption("👉 **Klik salah satu baris site** pada tabel di bawah untuk langsung melihat tren tegangannya.")
 
-        # Tabel interaktif klik baris
+        # Tabel interaktif klik baris langsung memicu update grafik
         selection_event = st.dataframe(
             summary,
             use_container_width=True,
@@ -304,14 +326,13 @@ else:
             "Site yang sedang dianalisis grafiknya:",
             options=all_sites,
             index=default_index,
-            help="Bisa dipilih manual atau otomatis berubah saat baris tabel di atas diklik."
+            help="Bisa dipilih manual atau otomatis berganti saat baris tabel di atas diklik."
         )
     with col_interval:
         chart_interval = st.selectbox("Interval Grafik:", options=["15 Menit", "1 Jam", "Data Asli"])
 
     if active_site:
-        with st.spinner(f"Memuat seluruh titik waktu untuk {active_site}..."):
-            # Ambil semua data site tanpa limit
+        with st.spinner(f"Memuat histori lengkap untuk {active_site}..."):
             query_site = (
                 db.table("bbu_voltage")
                 .select("begin_time, min_voltage, avg_voltage, max_voltage")
@@ -322,7 +343,6 @@ else:
             if cutoff_iso is not None:
                 query_site = query_site.gte("begin_time", cutoff_iso)
             
-            # Paginasi khusus site bila barisnya lebih dari 1000
             site_data = []
             s_start = 0
             while True:
@@ -340,7 +360,7 @@ else:
             df_site["begin_time"] = pd.to_datetime(df_site["begin_time"])
             df_site = df_site.set_index("begin_time").sort_index()
 
-            # Resample dengan menjaga NaN agar jeda kosong terputus
+            # Resample dengan menjaga NaN agar jeda waktu tanpa log data terputus/kosong
             if chart_interval == "15 Menit":
                 chart_df = df_site.resample("15min").agg({
                     "min_voltage": "min",
@@ -356,7 +376,6 @@ else:
             else:
                 chart_df = df_site[["min_voltage", "avg_voltage", "max_voltage"]].copy()
 
-            # Rentang sumbu Y dinamis
             val_min = chart_df["min_voltage"].min()
             val_max = chart_df["max_voltage"].max()
             
@@ -370,7 +389,7 @@ else:
 
             fig = go.Figure()
 
-            # Min Voltage (connectgaps=False agar jam tanpa data bolong)
+            # Min Voltage (connectgaps=False memastikan garis bolong jika ada waktu kosong)
             fig.add_trace(go.Scatter(
                 x=chart_df.index,
                 y=chart_df["min_voltage"],
@@ -381,7 +400,7 @@ else:
                 marker=dict(size=4)
             ))
 
-            # Avg Voltage
+            # Avg Voltage (connectgaps=False)
             fig.add_trace(go.Scatter(
                 x=chart_df.index,
                 y=chart_df["avg_voltage"],
@@ -392,7 +411,7 @@ else:
                 marker=dict(size=4)
             ))
 
-            # Max Voltage
+            # Max Voltage (connectgaps=False)
             fig.add_trace(go.Scatter(
                 x=chart_df.index,
                 y=chart_df["max_voltage"],
@@ -425,7 +444,6 @@ else:
 
             st.plotly_chart(fig, use_container_width=True)
 
-            # Statistik Cepat Site
             c1, c2, c3, c4 = st.columns(4)
             s_min = df_site["min_voltage"].min()
             s_avg = df_site["avg_voltage"].mean()
