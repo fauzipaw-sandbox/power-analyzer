@@ -80,7 +80,7 @@ if new_files_to_process:
                     elif "max" in c and ("volt" in c or "v" in c):
                         max_col = col
 
-                # Fallback: jika hanya ada satu kolom 'voltage' generik
+                # Fallback jika hanya ada satu kolom 'voltage'
                 if not min_col:
                     for col in df_raw.columns:
                         if "volt" in str(col).lower():
@@ -93,7 +93,7 @@ if new_files_to_process:
                     st.sidebar.error(f"Gagal mendeteksi kolom Waktu atau ME pada {current_file.name}")
                     continue
 
-                # 2. Filter replaceable unit 'VPD' jika kolomnya tersedia
+                # 2. Filter unit VPD jika kolom replaceable unit tersedia
                 df_filtered = df_raw.copy()
                 for col in df_filtered.columns:
                     c_low = str(col).lower()
@@ -103,7 +103,7 @@ if new_files_to_process:
                             df_filtered = df_filtered[has_vpd]
                         break
 
-                # 3. Bersihkan tanggal dan duplikat baris
+                # 3. Bersihkan tanggal dan duplikat baris internal
                 df_filtered["parsed_time"] = pd.to_datetime(df_filtered[time_col], errors="coerce")
                 df_filtered["managed_element"] = df_filtered[me_col].astype(str).str.strip()
                 df_clean = df_filtered.dropna(subset=["parsed_time", "managed_element"])
@@ -169,20 +169,35 @@ threshold_voltage = st.sidebar.number_input(
     step=0.5
 )
 
-# ================= AUTO LOAD DARI DATABASE =================
+# ================= AUTO LOAD SEMUA DATA DENGAN PAGINATION (BYPASS 1000 ROW LIMIT) =================
 @st.cache_data(ttl=30)
-def load_voltage_overview():
-    res = (
-        db.table("bbu_voltage")
-        .select("managed_element, min_voltage, avg_voltage, max_voltage, begin_time")
-        .order("begin_time", desc=False)
-        .limit(50000)
-        .execute()
-    )
-    return res.data
+def load_voltage_overview_paginated():
+    all_rows = []
+    chunk_size = 1000
+    current_start = 0
+    max_total_limit = 100000  # Kuota aman hingga 100.000 baris
+
+    while current_start < max_total_limit:
+        res = (
+            db.table("bbu_voltage")
+            .select("managed_element, min_voltage, avg_voltage, max_voltage, begin_time")
+            .order("begin_time", desc=False)
+            .range(current_start, current_start + chunk_size - 1)
+            .execute()
+        )
+        data = res.data
+        if not data:
+            break
+        all_rows.extend(data)
+        if len(data) < chunk_size:
+            break
+        current_start += chunk_size
+
+    return all_rows
 
 try:
-    all_raw_data = load_voltage_overview()
+    with st.spinner("Mengambil seluruh data site dari database..."):
+        all_raw_data = load_voltage_overview_paginated()
 except Exception as e:
     st.error(f"Gagal membaca data dari server: {str(e)}")
     all_raw_data = []
@@ -212,8 +227,8 @@ else:
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Batas Voltage", f"< {threshold_voltage} V")
     col2.metric("Rentang Waktu", f"{duration_hours} Jam Terakhir" if duration_hours else "Semua Data")
-    col3.metric("Site Terdampak Drop", f"{df_dropped['managed_element'].nunique()} Site")
-    col4.metric("Total Sampel Drop", f"{len(df_dropped)} Kali")
+    col3.metric("Total Site di Database", f"{df_all['managed_element'].nunique()} Site")
+    col4.metric("Site Terdampak Drop", f"{df_dropped['managed_element'].nunique()} Site")
 
     st.markdown("---")
 
@@ -244,9 +259,9 @@ else:
         summary["Voltage Terendah (V)"] = summary["Voltage Terendah (V)"].round(3)
         summary["Rata-rata Voltage (V)"] = summary["Rata-rata Voltage (V)"].round(3)
 
-        st.caption("👉 **Klik pada baris salah satu site** di tabel untuk langsung melihat grafik tren voltasenya di bawah.")
+        st.caption("👉 **Klik salah satu baris site** pada tabel di bawah untuk melihat tren tegangannya.")
 
-        # Tabel interaktif dengan deteksi event klik baris
+        # Tabel interaktif klik baris
         selection_event = st.dataframe(
             summary,
             use_container_width=True,
@@ -255,12 +270,10 @@ else:
             selection_mode="single-row"
         )
 
-        # Ambil site yang diklik pengguna
         if selection_event and selection_event.selection and selection_event.selection.rows:
             selected_row_idx = selection_event.selection.rows[0]
             selected_site = summary.iloc[selected_row_idx]["Managed Element (Site)"]
         else:
-            # Default ke site urutan pertama dengan drop tertinggi
             selected_site = summary.iloc[0]["Managed Element (Site)"]
 
         with st.expander("🔍 Lihat Rincian Log Kejadian Drop (Data Mentah)"):
@@ -280,14 +293,13 @@ else:
     else:
         st.success(f"Kondisi optimal. Tidak ditemukan site dengan voltage di bawah {threshold_voltage} V.")
 
-    # ================= GRAFIK TREN (LANGSUNG MUNCUL DI BAWAH TABEL) =================
+    # ================= GRAFIK TREN DI BAWAH TABEL =================
     st.markdown("---")
     
-    # Dropdown alternatif jika user ingin memilih site di luar daftar drop
     col_header, col_interval = st.columns([3, 1])
     with col_header:
         all_sites = sorted(df_all["managed_element"].unique().tolist())
-        default_index = all_sites.index(selected_site) if selected_site in all_sites else 0
+        default_index = all_sites.index(selected_site) if (selected_site and selected_site in all_sites) else 0
         active_site = st.selectbox(
             "Site yang sedang dianalisis grafiknya:",
             options=all_sites,
@@ -298,7 +310,8 @@ else:
         chart_interval = st.selectbox("Interval Grafik:", options=["15 Menit", "1 Jam", "Data Asli"])
 
     if active_site:
-        with st.spinner(f"Memuat histori tegangan untuk {active_site}..."):
+        with st.spinner(f"Memuat seluruh titik waktu untuk {active_site}..."):
+            # Ambil semua data site tanpa limit
             query_site = (
                 db.table("bbu_voltage")
                 .select("begin_time, min_voltage, avg_voltage, max_voltage")
@@ -309,15 +322,25 @@ else:
             if cutoff_iso is not None:
                 query_site = query_site.gte("begin_time", cutoff_iso)
             
-            res_site = query_site.execute()
-            site_data = res_site.data
+            # Paginasi khusus site bila barisnya lebih dari 1000
+            site_data = []
+            s_start = 0
+            while True:
+                res_s = query_site.range(s_start, s_start + 999).execute()
+                d_s = res_s.data
+                if not d_s:
+                    break
+                site_data.extend(d_s)
+                if len(d_s) < 1000:
+                    break
+                s_start += 1000
 
         if site_data and len(site_data) > 0:
             df_site = pd.DataFrame(site_data)
             df_site["begin_time"] = pd.to_datetime(df_site["begin_time"])
             df_site = df_site.set_index("begin_time").sort_index()
 
-            # Resample dengan menjaga NaN agar bagian waktu tanpa data putus/kosong
+            # Resample dengan menjaga NaN agar jeda kosong terputus
             if chart_interval == "15 Menit":
                 chart_df = df_site.resample("15min").agg({
                     "min_voltage": "min",
@@ -347,7 +370,7 @@ else:
 
             fig = go.Figure()
 
-            # Min Voltage (connectgaps=False agar jam tanpa data tidak disambung)
+            # Min Voltage (connectgaps=False agar jam tanpa data bolong)
             fig.add_trace(go.Scatter(
                 x=chart_df.index,
                 y=chart_df["min_voltage"],
