@@ -24,91 +24,104 @@ db = get_db_client()
 
 st.title("⚡ BBU Voltage Monitoring & Trend Analysis")
 
-# ================= SIDEBAR: OTOMATIS INGEST DATA =================
+# ================= SIDEBAR: OTOMATIS MULTI-UPLOAD =================
 st.sidebar.header("📥 Ingest Data PM")
-uploaded_file = st.sidebar.file_uploader(
-    "Upload File Excel BBU Voltage", 
+uploaded_files = st.sidebar.file_uploader(
+    "Upload File Excel BBU Voltage (Bisa Banyak):", 
     type=["xlsx", "xls"],
-    help="Data akan otomatis tersaring (hanya unit mengandung 'VPD') dan disimpan ke database."
+    accept_multiple_files=True,
+    help="Pilih satu atau beberapa file Excel. Data unit VPD akan otomatis diproses dan disimpan."
 )
 
-if "last_processed_file" not in st.session_state:
-    st.session_state.last_processed_file = None
+# Inisialisasi daftar file yang sudah diproses di session_state
+if "processed_file_names" not in st.session_state:
+    st.session_state.processed_file_names = set()
 
-if uploaded_file is not None and st.session_state.last_processed_file != uploaded_file.name:
-    with st.spinner("File terdeteksi, memfilter data unit 'VPD' dan menyimpan..."):
-        try:
-            df_raw = pd.read_excel(uploaded_file, engine="openpyxl")
-            
-            # 1. Cari kolom Replaceable Unit ID (fleksibel terhadap variasi penamaan)
-            unit_col = None
-            for col in df_raw.columns:
-                col_clean = str(col).lower().replace("_", " ").replace("-", " ")
-                if "replaceable unit" in col_clean or "replaceableunit" in col_clean:
-                    unit_col = col
-                    break
-            
-            df_filtered = df_raw.copy()
-            if unit_col:
-                # Filter HANYA yang mengandung 'VPD'
-                df_filtered = df_filtered[
-                    df_filtered[unit_col].astype(str).str.contains("VPD", case=False, na=False)
-                ]
-            else:
-                # Fallback: jika nama kolom berbeda, cari di seluruh kolom teks yang punya isi 'VPD'
-                vpd_mask = pd.Series(False, index=df_filtered.index)
-                for c in df_filtered.columns:
-                    if df_filtered[c].astype(str).str.contains("VPD", case=False, na=False).any():
-                        vpd_mask = vpd_mask | df_filtered[c].astype(str).str.contains("VPD", case=False, na=False)
-                if vpd_mask.any():
-                    df_filtered = df_filtered[vpd_mask]
+# Helper fungsi konversi tegangan aman
+def parse_voltage(val):
+    if pd.isna(val) or val is None:
+        return None
+    try:
+        val_str = str(val).strip().replace(",", ".")
+        f_val = float(val_str)
+        return None if np.isnan(f_val) else f_val
+    except:
+        return None
 
-            if df_filtered.empty:
-                st.sidebar.warning("Tidak ditemukan baris dengan Replaceable Unit ID mengandung 'VPD'.")
-                st.session_state.last_processed_file = uploaded_file.name
-            else:
-                # 2. Bersihkan format tanggal dan nama site
-                df_filtered["parsed_time"] = pd.to_datetime(df_filtered["Begin Time"], errors="coerce")
-                df_filtered["managed_element"] = df_filtered["Managed Element"].astype(str).str.strip()
+# Cek apakah ada file baru yang belum pernah diproses pada sesi ini
+new_files_to_process = [
+    f for f in (uploaded_files or []) 
+    if f.name not in st.session_state.processed_file_names
+]
+
+if new_files_to_process:
+    total_saved_all_files = 0
+    with st.spinner(f"Memproses otomatis {len(new_files_to_process)} file baru ke database..."):
+        for current_file in new_files_to_process:
+            try:
+                df_raw = pd.read_excel(current_file, engine="openpyxl")
+
+                # Standarisasi pencarian nama kolom
+                col_map = {}
+                for col in df_raw.columns:
+                    c_clean = str(col).lower().replace(" ", "").replace("_", "").replace("(", "").replace(")", "")
+                    col_map[c_clean] = col
+
+                time_col = col_map.get("begintime", "Begin Time")
+                me_col = col_map.get("managedelement", "Managed Element")
+                min_col = col_map.get("minvoltageofbbuv") or col_map.get("minvoltage") or col_map.get("minvoltageofbbu")
+                avg_col = col_map.get("avgvoltageofbbuv") or col_map.get("avgvoltage") or col_map.get("avgvoltageofbbu")
+                max_col = col_map.get("maxvoltageofbbuv") or col_map.get("maxvoltage") or col_map.get("maxvoltageofbbu")
+
+                # Filter unit VPD jika kolom replaceable unit tersedia
+                unit_col = None
+                for c_clean, c_orig in col_map.items():
+                    if "replaceableunit" in c_clean or "unitid" in c_clean:
+                        unit_col = c_orig
+                        break
+
+                df_filtered = df_raw.copy()
+                if unit_col:
+                    has_vpd = df_filtered[unit_col].astype(str).str.contains("VPD", case=False, na=False)
+                    if has_vpd.any():
+                        df_filtered = df_filtered[has_vpd]
+
+                # Bersihkan tanggal dan Site
+                df_filtered["parsed_time"] = pd.to_datetime(df_filtered[time_col], errors="coerce")
+                df_filtered["managed_element"] = df_filtered[me_col].astype(str).str.strip()
                 df_clean = df_filtered.dropna(subset=["parsed_time", "managed_element"])
-                
-                # 3. Hapus duplikat dalam file sebelum dikirim
+
+                # Hapus duplikat per file sebelum upsert
                 df_clean = df_clean.drop_duplicates(subset=["parsed_time", "managed_element"], keep="last")
-                
-                # 4. Bentuk payload JSON
+
                 records = []
                 for _, row in df_clean.iterrows():
-                    min_v = row.get("MinVoltageOfBBU(V)")
-                    avg_v = row.get("AvgVoltageOfBBU(V)")
-                    max_v = row.get("MaxVoltageOfBBU(V)")
-                    
                     records.append({
                         "begin_time": row["parsed_time"].isoformat(),
                         "managed_element": row["managed_element"],
-                        "min_voltage": float(min_v) if pd.notna(min_v) and not np.isnan(min_v) else None,
-                        "avg_voltage": float(avg_v) if pd.notna(avg_v) and not np.isnan(avg_v) else None,
-                        "max_voltage": float(max_v) if pd.notna(max_v) and not np.isnan(max_v) else None,
+                        "min_voltage": parse_voltage(row[min_col]) if min_col in row else None,
+                        "avg_voltage": parse_voltage(row[avg_col]) if avg_col in row else None,
+                        "max_voltage": parse_voltage(row[max_col]) if max_col in row else None,
                     })
 
-                # 5. Batch upsert ke database
+                # Batch upsert per file
                 batch_size = 250
-                total_records = len(records)
-                progress_bar = st.sidebar.progress(0)
-                
-                for i in range(0, total_records, batch_size):
+                for i in range(0, len(records), batch_size):
                     batch = records[i:i + batch_size]
                     db.table("bbu_voltage").upsert(
                         batch,
                         on_conflict="managed_element,begin_time"
                     ).execute()
-                    progress_bar.progress(min((i + batch_size) / total_records, 1.0))
-                
-                st.session_state.last_processed_file = uploaded_file.name
-                st.sidebar.success(f"Berhasil menyimpan {total_records} data VPD ke database!")
-                st.cache_data.clear()
-                st.rerun()
-        except Exception as e:
-            st.sidebar.error(f"Gagal memproses data: {str(e)}")
+
+                total_saved_all_files += len(records)
+                st.session_state.processed_file_names.add(current_file.name)
+            except Exception as e:
+                st.sidebar.error(f"Gagal memproses file {current_file.name}: {str(e)}")
+
+        if total_saved_all_files > 0:
+            st.sidebar.success(f"Berhasil menyimpan {total_saved_all_files} baris data dari {len(new_files_to_process)} file!")
+            st.cache_data.clear()
+            st.rerun()
 
 st.sidebar.markdown("---")
 
@@ -167,8 +180,9 @@ else:
         cutoff_time = max_time - timedelta(hours=int(duration_hours))
         df_all = df_all[df_all["begin_time"] >= cutoff_time]
 
-    # Filter site di bawah batas voltage
-    df_dropped = df_all[df_all["min_voltage"] < threshold_voltage]
+    # Filter site di bawah batas voltage (abaikan baris null)
+    df_valid_voltage = df_all.dropna(subset=["min_voltage"])
+    df_dropped = df_valid_voltage[df_valid_voltage["min_voltage"] < threshold_voltage]
 
     # Metrics Ringkasan
     col1, col2, col3, col4 = st.columns(4)
