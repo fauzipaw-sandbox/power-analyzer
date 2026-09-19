@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from supabase import create_client, Client
 
 st.set_page_config(
@@ -32,7 +32,7 @@ uploaded_file = st.sidebar.file_uploader(
     help="Data akan otomatis tersimpan begitu file selesai diunggah."
 )
 
-# Deteksi upload otomatis menggunakan session state agar tidak looping
+# Deteksi upload otomatis menggunakan session state agar tidak reload berulang
 if "last_processed_file" not in st.session_state:
     st.session_state.last_processed_file = None
 
@@ -47,10 +47,10 @@ if uploaded_file is not None and st.session_state.last_processed_file != uploade
             df_clean["managed_element"] = df_clean["Managed Element"].astype(str).str.strip()
             df_clean = df_clean.dropna(subset=["parsed_time", "managed_element"])
             
-            # 2. Hapus duplikat baris dalam file
+            # 2. Hapus duplikat dalam file sebelum dikirim (mencegah error Postgres 21000)
             df_clean = df_clean.drop_duplicates(subset=["parsed_time", "managed_element"], keep="last")
             
-            # 3. Bentuk payload data
+            # 3. Bentuk payload data JSON
             records = []
             for _, row in df_clean.iterrows():
                 min_v = row.get("MinVoltageOfBBU(V)")
@@ -80,6 +80,7 @@ if uploaded_file is not None and st.session_state.last_processed_file != uploade
             
             st.session_state.last_processed_file = uploaded_file.name
             st.sidebar.success(f"Berhasil menyimpan {total_records} data unik!")
+            st.cache_data.clear()
             st.rerun()
         except Exception as e:
             st.sidebar.error(f"Gagal memproses data: {str(e)}")
@@ -88,46 +89,68 @@ st.sidebar.markdown("---")
 
 # ================= SIDEBAR: PARAMETER FILTER =================
 st.sidebar.header("⚙️ Parameter Filter")
-duration_hours = st.sidebar.number_input("Rentang Waktu Terakhir (Jam):", min_value=1, max_value=720, value=24, step=1)
-threshold_voltage = st.sidebar.number_input("Batas Voltage Drop (V):", min_value=30.0, max_value=60.0, value=47.0, step=0.5)
+filter_mode = st.sidebar.radio("Mode Rentang Waktu:", ["Berdasarkan Data Terakhir", "Semua Data"])
 
-# Cut-off waktu mundur (UTC)
-time_limit = (datetime.now(timezone.utc) - timedelta(hours=int(duration_hours))).isoformat()
+if filter_mode == "Berdasarkan Data Terakhir":
+    duration_hours = st.sidebar.slider(
+        "Rentang Waktu Terakhir (Jam):",
+        min_value=1,
+        max_value=72,
+        value=24,
+        step=1,
+        help="Geser untuk menentukan berapa jam ke belakang dari data timestamp terakhir"
+    )
+else:
+    duration_hours = None
+
+threshold_voltage = st.sidebar.number_input(
+    "Batas Voltage Drop (V):", 
+    min_value=30.0, 
+    max_value=60.0, 
+    value=47.0, 
+    step=0.5
+)
 
 # ================= AUTO LOAD DARI DATABASE =================
-@st.cache_data(ttl=60)
-def load_voltage_records(limit_time_str: str):
+@st.cache_data(ttl=30)
+def load_all_voltage_records():
     res = (
         db.table("bbu_voltage")
         .select("managed_element, min_voltage, avg_voltage, max_voltage, begin_time")
-        .gte("begin_time", limit_time_str)
         .order("begin_time", desc=False)
+        .limit(50000)
         .execute()
     )
     return res.data
 
 try:
-    all_data = load_voltage_records(time_limit)
+    all_raw_data = load_all_voltage_records()
 except Exception as e:
     st.error(f"Gagal membaca data dari server: {str(e)}")
-    all_data = []
+    all_raw_data = []
 
-# ================= TAMPILAN DASHBOARD =================
-if not all_data:
-    st.info(f"Tidak ada rekaman data pada rentang {duration_hours} jam terakhir. Silakan unggah file Excel PM pada panel sebelah kiri.")
+# ================= FILTERING PADA DATAFRAME =================
+if not all_raw_data:
+    st.info("Database masih kosong. Silakan unggah file Excel PM pada panel sebelah kiri.")
 else:
-    df_all = pd.DataFrame(all_data)
+    df_all = pd.DataFrame(all_raw_data)
     df_all["begin_time"] = pd.to_datetime(df_all["begin_time"])
-    
-    # Filter site di bawah threshold
+
+    # Filter rentang jam mundur dari timestamp TERAKHIR di database
+    if duration_hours is not None and not df_all.empty:
+        max_time = df_all["begin_time"].max()
+        cutoff_time = max_time - timedelta(hours=int(duration_hours))
+        df_all = df_all[df_all["begin_time"] >= cutoff_time]
+
+    # Filter site di bawah batas voltage
     df_dropped = df_all[df_all["min_voltage"] < threshold_voltage]
 
     # Metrics Ringkasan
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Batas Voltage", f"< {threshold_voltage} V")
-    col2.metric("Rentang Waktu", f"{duration_hours} Jam Terakhir")
+    col2.metric("Rentang Waktu", f"{duration_hours} Jam Terakhir" if duration_hours else "Semua Data")
     col3.metric("Site Terdampak Drop", f"{df_dropped['managed_element'].nunique()} Site")
-    col4.metric("Total Sampel Kejadian", f"{len(df_dropped)} Kali")
+    col4.metric("Total Kejadian Drop", f"{len(df_dropped)} Sampel")
 
     st.markdown("---")
 
@@ -159,7 +182,7 @@ else:
             st.subheader(f"Daftar Site Terdampak Voltage < {threshold_voltage} V")
             st.dataframe(summary, use_container_width=True, hide_index=True)
 
-            with st.expander("🔍 Lihat Rincian Log Per Jam"):
+            with st.expander("🔍 Lihat Rincian Log Per Jam (Data Mentah)"):
                 df_detail = df_dropped.copy().sort_values(by="begin_time", ascending=False)
                 df_detail["Waktu (Lokal)"] = df_detail["begin_time"].dt.strftime("%Y-%m-%d %H:%M")
                 st.dataframe(
@@ -174,7 +197,7 @@ else:
                     hide_index=True
                 )
         else:
-            st.success(f"Kondisi optimal. Tidak ada site dengan tegangan di bawah {threshold_voltage} V dalam {duration_hours} jam terakhir.")
+            st.success(f"Kondisi optimal. Tidak ditemukan site dengan voltage di bawah {threshold_voltage} V.")
 
     with tab2:
         st.subheader("Grafik Pergerakan Min, Avg, dan Max Voltage")
