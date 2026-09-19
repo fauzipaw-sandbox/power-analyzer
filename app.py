@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from supabase import create_client, Client
+import plotly.graph_objects as go
 
 st.set_page_config(
     page_title="BBU Voltage Monitoring & Analysis",
@@ -276,7 +277,6 @@ else:
             chart_interval = st.selectbox("Interval Waktu:", options=["15 Menit", "Data Asli", "1 Jam"])
 
         if selected_site:
-            # Query targeted khusus site terpilih agar seluruh histori snapshot tertarik
             with st.spinner(f"Memuat histori lengkap untuk {selected_site}..."):
                 query_site = (
                     db.table("bbu_voltage")
@@ -310,15 +310,79 @@ else:
                         "max_voltage": "max"
                     }).dropna(how="all")
                 else:
-                    chart_df = df_site[["min_voltage", "avg_voltage", "max_voltage"]]
+                    chart_df = df_site[["min_voltage", "avg_voltage", "max_voltage"]].copy()
 
-                chart_df.columns = ["Min Voltage (V)", "Avg Voltage (V)", "Max Voltage (V)"]
+                # ================= PLOTLY DYNAMIC Y-AXIS CHART =================
+                # Hitung batas Y dinamis agar grafik tidak flat dari 0
+                val_min = chart_df["min_voltage"].min()
+                val_max = chart_df["max_voltage"].max()
                 
-                # Line Chart interaktif
-                st.line_chart(chart_df, color=["#E53E3E", "#3182CE", "#38A169"])
-                st.caption(f"Menampilkan {len(chart_df)} data point waktu untuk site {selected_site}.")
+                # Buat padding 10% atau minimal 1.5V di atas dan di bawah
+                if pd.notna(val_min) and pd.notna(val_max):
+                    span = max(val_max - val_min, 2.0)
+                    y_bottom = max(0.0, float(val_min) - span * 0.15)
+                    y_top = float(val_max) + span * 0.15
+                    # Pastikan threshold masuk dalam rentang penglihatan
+                    y_bottom = min(y_bottom, float(threshold_voltage) - 1.0)
+                else:
+                    y_bottom, y_top = 40.0, 56.0
 
-                # Ringkasan statistik site terpilih
+                fig = go.Figure()
+
+                # Garis Min Voltage
+                fig.add_trace(go.Scatter(
+                    x=chart_df.index,
+                    y=chart_df["min_voltage"],
+                    mode="lines+markers",
+                    name="Min Voltage (V)",
+                    line=dict(color="#EF4444", width=2),
+                    marker=dict(size=4)
+                ))
+
+                # Garis Avg Voltage
+                fig.add_trace(go.Scatter(
+                    x=chart_df.index,
+                    y=chart_df["avg_voltage"],
+                    mode="lines+markers",
+                    name="Avg Voltage (V)",
+                    line=dict(color="#3B82F6", width=2),
+                    marker=dict(size=4)
+                ))
+
+                # Garis Max Voltage
+                fig.add_trace(go.Scatter(
+                    x=chart_df.index,
+                    y=chart_df["max_voltage"],
+                    mode="lines+markers",
+                    name="Max Voltage (V)",
+                    line=dict(color="#10B981", width=2),
+                    marker=dict(size=4)
+                ))
+
+                # Garis Batas Ambang (Threshold Line Merah Putus-putus)
+                fig.add_hline(
+                    y=threshold_voltage,
+                    line_dash="dash",
+                    line_color="#DC2626",
+                    annotation_text=f"Batas Ambang ({threshold_voltage} V)",
+                    annotation_position="bottom right"
+                )
+
+                fig.update_layout(
+                    title=f"Tren Tegangan BBU - {selected_site}",
+                    xaxis_title="Waktu",
+                    yaxis_title="Voltage (V)",
+                    yaxis=dict(range=[y_bottom, y_top]),
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=20, r=20, t=50, b=20),
+                    template="plotly_dark"
+                )
+
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption(f"Menampilkan {len(chart_df)} data point waktu untuk {selected_site}. Skala sumbu Y dinamis: {y_bottom:.1f} V s/d {y_top:.1f} V.")
+
+                # Ringkasan statistik site
                 s_min = df_site["min_voltage"].min()
                 s_avg = df_site["avg_voltage"].mean()
                 s_max = df_site["max_voltage"].max()
