@@ -263,7 +263,7 @@ else:
             st.success(f"Kondisi optimal. Tidak ditemukan site dengan voltage di bawah {threshold_voltage} V.")
 
     with tab2:
-        st.subheader("Grafik Pergerakan Voltage Per 15 Menit")
+        st.subheader("Grafik Pergerakan Voltage")
         
         # Susun daftar site dengan memprioritaskan yang mengalami drop
         dropped_sites = sorted(df_dropped["managed_element"].unique().tolist()) if not df_dropped.empty else []
@@ -274,7 +274,7 @@ else:
         with col_select_site:
             selected_site = st.selectbox("Pilih Site / Managed Element:", options=site_list)
         with col_select_res:
-            chart_interval = st.selectbox("Interval Waktu:", options=["15 Menit", "Data Asli", "1 Jam"])
+            chart_interval = st.selectbox("Interval Waktu:", options=["15 Menit", "1 Jam", "Data Asli"])
 
         if selected_site:
             with st.spinner(f"Memuat histori lengkap untuk {selected_site}..."):
@@ -296,70 +296,70 @@ else:
                 df_site["begin_time"] = pd.to_datetime(df_site["begin_time"])
                 df_site = df_site.set_index("begin_time").sort_index()
 
-                # Resampling sesuai interval
+                # RESAMPLE DENGAN TETAP MENJAGA NaN (AGAR WAKTU KOSONG TIDAK TERSAMBUNG)
                 if chart_interval == "15 Menit":
                     chart_df = df_site.resample("15min").agg({
                         "min_voltage": "min",
                         "avg_voltage": "mean",
                         "max_voltage": "max"
-                    }).dropna(how="all")
+                    })
                 elif chart_interval == "1 Jam":
                     chart_df = df_site.resample("1h").agg({
                         "min_voltage": "min",
                         "avg_voltage": "mean",
                         "max_voltage": "max"
-                    }).dropna(how="all")
+                    })
                 else:
                     chart_df = df_site[["min_voltage", "avg_voltage", "max_voltage"]].copy()
 
-                # ================= PLOTLY DYNAMIC Y-AXIS CHART =================
                 # Hitung batas Y dinamis agar grafik tidak flat dari 0
                 val_min = chart_df["min_voltage"].min()
                 val_max = chart_df["max_voltage"].max()
                 
-                # Buat padding 10% atau minimal 1.5V di atas dan di bawah
                 if pd.notna(val_min) and pd.notna(val_max):
                     span = max(val_max - val_min, 2.0)
                     y_bottom = max(0.0, float(val_min) - span * 0.15)
                     y_top = float(val_max) + span * 0.15
-                    # Pastikan threshold masuk dalam rentang penglihatan
                     y_bottom = min(y_bottom, float(threshold_voltage) - 1.0)
                 else:
                     y_bottom, y_top = 40.0, 56.0
 
                 fig = go.Figure()
 
-                # Garis Min Voltage
+                # Min Voltage (connectgaps=False agar periode kosong terputus)
                 fig.add_trace(go.Scatter(
                     x=chart_df.index,
                     y=chart_df["min_voltage"],
                     mode="lines+markers",
                     name="Min Voltage (V)",
+                    connectgaps=False,
                     line=dict(color="#EF4444", width=2),
                     marker=dict(size=4)
                 ))
 
-                # Garis Avg Voltage
+                # Avg Voltage (connectgaps=False)
                 fig.add_trace(go.Scatter(
                     x=chart_df.index,
                     y=chart_df["avg_voltage"],
                     mode="lines+markers",
                     name="Avg Voltage (V)",
+                    connectgaps=False,
                     line=dict(color="#3B82F6", width=2),
                     marker=dict(size=4)
                 ))
 
-                # Garis Max Voltage
+                # Max Voltage (connectgaps=False)
                 fig.add_trace(go.Scatter(
                     x=chart_df.index,
                     y=chart_df["max_voltage"],
                     mode="lines+markers",
                     name="Max Voltage (V)",
+                    connectgaps=False,
                     line=dict(color="#10B981", width=2),
                     marker=dict(size=4)
                 ))
 
-                # Garis Batas Ambang (Threshold Line Merah Putus-putus)
+                # Garis Batas Ambang (Threshold)
                 fig.add_hline(
                     y=threshold_voltage,
                     line_dash="dash",
@@ -380,7 +380,8 @@ else:
                 )
 
                 st.plotly_chart(fig, use_container_width=True)
-                st.caption(f"Menampilkan {len(chart_df)} data point waktu untuk {selected_site}. Skala sumbu Y dinamis: {y_bottom:.1f} V s/d {y_top:.1f} V.")
+                valid_points = chart_df["min_voltage"].dropna().count()
+                st.caption(f"Menampilkan {valid_points} titik data valid untuk {selected_site}. Garis terputus otomatis pada jam yang tidak memiliki rekaman data.")
 
                 # Ringkasan statistik site
                 s_min = df_site["min_voltage"].min()
