@@ -30,14 +30,12 @@ uploaded_files = st.sidebar.file_uploader(
     "Upload File Excel BBU Voltage (Bisa Banyak):", 
     type=["xlsx", "xls"],
     accept_multiple_files=True,
-    help="Pilih satu atau beberapa file Excel. Data unit VPD akan otomatis diproses dan disimpan."
+    help="Pilih satu atau beberapa file Excel. Data otomatis diproses dan disimpan ke database."
 )
 
-# Inisialisasi daftar file yang sudah diproses di session_state
 if "processed_file_names" not in st.session_state:
     st.session_state.processed_file_names = set()
 
-# Helper fungsi konversi tegangan aman
 def parse_voltage(val):
     if pd.isna(val) or val is None:
         return None
@@ -48,7 +46,6 @@ def parse_voltage(val):
     except:
         return None
 
-# Cek apakah ada file baru yang belum pernah diproses pada sesi ini
 new_files_to_process = [
     f for f in (uploaded_files or []) 
     if f.name not in st.session_state.processed_file_names
@@ -56,55 +53,77 @@ new_files_to_process = [
 
 if new_files_to_process:
     total_saved_all_files = 0
-    with st.spinner(f"Memproses otomatis {len(new_files_to_process)} file baru ke database..."):
+    with st.spinner(f"Memproses otomatis {len(new_files_to_process)} file ke database..."):
         for current_file in new_files_to_process:
             try:
                 df_raw = pd.read_excel(current_file, engine="openpyxl")
 
-                # Standarisasi pencarian nama kolom
-                col_map = {}
+                # 1. Deteksi dinamis kolom waktu, ME, dan voltage
+                time_col = None
+                me_col = None
+                min_col = None
+                avg_col = None
+                max_col = None
+
                 for col in df_raw.columns:
-                    c_clean = str(col).lower().replace(" ", "").replace("_", "").replace("(", "").replace(")", "")
-                    col_map[c_clean] = col
+                    c = str(col).lower().replace(" ", "").replace("_", "").replace(".", "").replace("(", "").replace(")", "")
+                    
+                    if ("begintime" in c or "starttime" in c or "time" in c) and not time_col:
+                        time_col = col
+                    elif "managedelement" in c or "nename" in c or "site" in c:
+                        me_col = col
+                    elif "min" in c and ("volt" in c or "v" in c):
+                        min_col = col
+                    elif ("avg" in c or "mean" in c) and ("volt" in c or "v" in c):
+                        avg_col = col
+                    elif "max" in c and ("volt" in c or "v" in c):
+                        max_col = col
 
-                time_col = col_map.get("begintime", "Begin Time")
-                me_col = col_map.get("managedelement", "Managed Element")
-                min_col = col_map.get("minvoltageofbbuv") or col_map.get("minvoltage") or col_map.get("minvoltageofbbu")
-                avg_col = col_map.get("avgvoltageofbbuv") or col_map.get("avgvoltage") or col_map.get("avgvoltageofbbu")
-                max_col = col_map.get("maxvoltageofbbuv") or col_map.get("maxvoltage") or col_map.get("maxvoltageofbbu")
+                # Fallback: jika hanya ada satu kolom 'voltage' generik
+                if not min_col:
+                    for col in df_raw.columns:
+                        if "volt" in str(col).lower():
+                            min_col = col
+                            avg_col = col
+                            max_col = col
+                            break
 
-                # Filter unit VPD jika kolom replaceable unit tersedia
-                unit_col = None
-                for c_clean, c_orig in col_map.items():
-                    if "replaceableunit" in c_clean or "unitid" in c_clean:
-                        unit_col = c_orig
+                if not time_col or not me_col:
+                    st.sidebar.error(f"Gagal mendeteksi kolom Waktu atau ME pada {current_file.name}")
+                    continue
+
+                # 2. Filter replaceable unit 'VPD' jika kolomnya tersedia
+                df_filtered = df_raw.copy()
+                for col in df_filtered.columns:
+                    c_low = str(col).lower()
+                    if "replaceable" in c_low or "unit" in c_low:
+                        has_vpd = df_filtered[col].astype(str).str.contains("VPD", case=False, na=False)
+                        if has_vpd.any():
+                            df_filtered = df_filtered[has_vpd]
                         break
 
-                df_filtered = df_raw.copy()
-                if unit_col:
-                    has_vpd = df_filtered[unit_col].astype(str).str.contains("VPD", case=False, na=False)
-                    if has_vpd.any():
-                        df_filtered = df_filtered[has_vpd]
-
-                # Bersihkan tanggal dan Site
+                # 3. Bersihkan tanggal dan duplikat baris
                 df_filtered["parsed_time"] = pd.to_datetime(df_filtered[time_col], errors="coerce")
                 df_filtered["managed_element"] = df_filtered[me_col].astype(str).str.strip()
                 df_clean = df_filtered.dropna(subset=["parsed_time", "managed_element"])
-
-                # Hapus duplikat per file sebelum upsert
                 df_clean = df_clean.drop_duplicates(subset=["parsed_time", "managed_element"], keep="last")
 
+                # 4. Susun records dengan konversi float aman
                 records = []
                 for _, row in df_clean.iterrows():
+                    val_min = parse_voltage(row[min_col]) if min_col and min_col in row else None
+                    val_avg = parse_voltage(row[avg_col]) if avg_col and avg_col in row else None
+                    val_max = parse_voltage(row[max_col]) if max_col and max_col in row else None
+
                     records.append({
                         "begin_time": row["parsed_time"].isoformat(),
                         "managed_element": row["managed_element"],
-                        "min_voltage": parse_voltage(row[min_col]) if min_col in row else None,
-                        "avg_voltage": parse_voltage(row[avg_col]) if avg_col in row else None,
-                        "max_voltage": parse_voltage(row[max_col]) if max_col in row else None,
+                        "min_voltage": val_min,
+                        "avg_voltage": val_avg,
+                        "max_voltage": val_max,
                     })
 
-                # Batch upsert per file
+                # 5. Upsert batch ke database
                 batch_size = 250
                 for i in range(0, len(records), batch_size):
                     batch = records[i:i + batch_size]
@@ -116,10 +135,10 @@ if new_files_to_process:
                 total_saved_all_files += len(records)
                 st.session_state.processed_file_names.add(current_file.name)
             except Exception as e:
-                st.sidebar.error(f"Gagal memproses file {current_file.name}: {str(e)}")
+                st.sidebar.error(f"Error memproses {current_file.name}: {str(e)}")
 
         if total_saved_all_files > 0:
-            st.sidebar.success(f"Berhasil menyimpan {total_saved_all_files} baris data dari {len(new_files_to_process)} file!")
+            st.sidebar.success(f"Berhasil menyimpan {total_saved_all_files} baris data!")
             st.cache_data.clear()
             st.rerun()
 
@@ -136,7 +155,7 @@ if filter_mode == "Berdasarkan Data Terakhir":
         max_value=72,
         value=24,
         step=1,
-        help="Geser untuk menentukan berapa jam ke belakang dari data timestamp terakhir"
+        help="Geser untuk menentukan durasi mundur dari timestamp data paling akhir"
     )
 else:
     duration_hours = None
@@ -174,13 +193,13 @@ else:
     df_all = pd.DataFrame(all_raw_data)
     df_all["begin_time"] = pd.to_datetime(df_all["begin_time"])
 
-    # Filter rentang jam mundur dari timestamp TERAKHIR di database
+    # Filter rentang jam mundur dari timestamp data paling akhir
     if duration_hours is not None and not df_all.empty:
         max_time = df_all["begin_time"].max()
         cutoff_time = max_time - timedelta(hours=int(duration_hours))
         df_all = df_all[df_all["begin_time"] >= cutoff_time]
 
-    # Filter site di bawah batas voltage (abaikan baris null)
+    # Filter drop voltage (hanya baris dengan angka valid)
     df_valid_voltage = df_all.dropna(subset=["min_voltage"])
     df_dropped = df_valid_voltage[df_valid_voltage["min_voltage"] < threshold_voltage]
 
