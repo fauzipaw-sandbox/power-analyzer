@@ -29,59 +29,84 @@ st.sidebar.header("📥 Ingest Data PM")
 uploaded_file = st.sidebar.file_uploader(
     "Upload File Excel BBU Voltage", 
     type=["xlsx", "xls"],
-    help="Data akan otomatis tersimpan begitu file selesai diunggah."
+    help="Data akan otomatis tersaring (hanya unit mengandung 'VPD') dan disimpan ke database."
 )
 
-# Deteksi upload otomatis menggunakan session state agar tidak reload berulang
 if "last_processed_file" not in st.session_state:
     st.session_state.last_processed_file = None
 
 if uploaded_file is not None and st.session_state.last_processed_file != uploaded_file.name:
-    with st.spinner("File terdeteksi, memproses data otomatis..."):
+    with st.spinner("File terdeteksi, memfilter data unit 'VPD' dan menyimpan..."):
         try:
             df_raw = pd.read_excel(uploaded_file, engine="openpyxl")
             
-            # 1. Bersihkan format tanggal dan nama site
-            df_clean = df_raw.copy()
-            df_clean["parsed_time"] = pd.to_datetime(df_clean["Begin Time"], errors="coerce")
-            df_clean["managed_element"] = df_clean["Managed Element"].astype(str).str.strip()
-            df_clean = df_clean.dropna(subset=["parsed_time", "managed_element"])
+            # 1. Cari kolom Replaceable Unit ID (fleksibel terhadap variasi penamaan)
+            unit_col = None
+            for col in df_raw.columns:
+                col_clean = str(col).lower().replace("_", " ").replace("-", " ")
+                if "replaceable unit" in col_clean or "replaceableunit" in col_clean:
+                    unit_col = col
+                    break
             
-            # 2. Hapus duplikat dalam file sebelum dikirim (mencegah error Postgres 21000)
-            df_clean = df_clean.drop_duplicates(subset=["parsed_time", "managed_element"], keep="last")
-            
-            # 3. Bentuk payload data JSON
-            records = []
-            for _, row in df_clean.iterrows():
-                min_v = row.get("MinVoltageOfBBU(V)")
-                avg_v = row.get("AvgVoltageOfBBU(V)")
-                max_v = row.get("MaxVoltageOfBBU(V)")
-                
-                records.append({
-                    "begin_time": row["parsed_time"].isoformat(),
-                    "managed_element": row["managed_element"],
-                    "min_voltage": float(min_v) if pd.notna(min_v) and not np.isnan(min_v) else None,
-                    "avg_voltage": float(avg_v) if pd.notna(avg_v) and not np.isnan(avg_v) else None,
-                    "max_voltage": float(max_v) if pd.notna(max_v) and not np.isnan(max_v) else None,
-                })
+            df_filtered = df_raw.copy()
+            if unit_col:
+                # Filter HANYA yang mengandung 'VPD'
+                df_filtered = df_filtered[
+                    df_filtered[unit_col].astype(str).str.contains("VPD", case=False, na=False)
+                ]
+            else:
+                # Fallback: jika nama kolom berbeda, cari di seluruh kolom teks yang punya isi 'VPD'
+                vpd_mask = pd.Series(False, index=df_filtered.index)
+                for c in df_filtered.columns:
+                    if df_filtered[c].astype(str).str.contains("VPD", case=False, na=False).any():
+                        vpd_mask = vpd_mask | df_filtered[c].astype(str).str.contains("VPD", case=False, na=False)
+                if vpd_mask.any():
+                    df_filtered = df_filtered[vpd_mask]
 
-            # 4. Simpan batch ke database
-            batch_size = 250
-            total_records = len(records)
-            progress_bar = st.sidebar.progress(0)
-            
-            for i in range(0, total_records, batch_size):
-                batch = records[i:i + batch_size]
-                db.table("bbu_voltage").upsert(
-                    batch,
-                    on_conflict="managed_element,begin_time"
-                ).execute()
-                progress_bar.progress(min((i + batch_size) / total_records, 1.0))
-            
-            st.session_state.last_processed_file = uploaded_file.name
-            st.sidebar.success(f"Berhasil menyimpan {total_records} data unik!")
-            st.cache_data.clear()
-            st.rerun()
+            if df_filtered.empty:
+                st.sidebar.warning("Tidak ditemukan baris dengan Replaceable Unit ID mengandung 'VPD'.")
+                st.session_state.last_processed_file = uploaded_file.name
+            else:
+                # 2. Bersihkan format tanggal dan nama site
+                df_filtered["parsed_time"] = pd.to_datetime(df_filtered["Begin Time"], errors="coerce")
+                df_filtered["managed_element"] = df_filtered["Managed Element"].astype(str).str.strip()
+                df_clean = df_filtered.dropna(subset=["parsed_time", "managed_element"])
+                
+                # 3. Hapus duplikat dalam file sebelum dikirim
+                df_clean = df_clean.drop_duplicates(subset=["parsed_time", "managed_element"], keep="last")
+                
+                # 4. Bentuk payload JSON
+                records = []
+                for _, row in df_clean.iterrows():
+                    min_v = row.get("MinVoltageOfBBU(V)")
+                    avg_v = row.get("AvgVoltageOfBBU(V)")
+                    max_v = row.get("MaxVoltageOfBBU(V)")
+                    
+                    records.append({
+                        "begin_time": row["parsed_time"].isoformat(),
+                        "managed_element": row["managed_element"],
+                        "min_voltage": float(min_v) if pd.notna(min_v) and not np.isnan(min_v) else None,
+                        "avg_voltage": float(avg_v) if pd.notna(avg_v) and not np.isnan(avg_v) else None,
+                        "max_voltage": float(max_v) if pd.notna(max_v) and not np.isnan(max_v) else None,
+                    })
+
+                # 5. Batch upsert ke database
+                batch_size = 250
+                total_records = len(records)
+                progress_bar = st.sidebar.progress(0)
+                
+                for i in range(0, total_records, batch_size):
+                    batch = records[i:i + batch_size]
+                    db.table("bbu_voltage").upsert(
+                        batch,
+                        on_conflict="managed_element,begin_time"
+                    ).execute()
+                    progress_bar.progress(min((i + batch_size) / total_records, 1.0))
+                
+                st.session_state.last_processed_file = uploaded_file.name
+                st.sidebar.success(f"Berhasil menyimpan {total_records} data VPD ke database!")
+                st.cache_data.clear()
+                st.rerun()
         except Exception as e:
             st.sidebar.error(f"Gagal memproses data: {str(e)}")
 
