@@ -213,7 +213,7 @@ else:
     st.markdown("---")
 
     # Tab Visualisasi
-    tab1, tab2 = st.tabs(["📊 Ranking Drop Voltage", "📈 Grafik Tren Voltage"])
+    tab1, tab2 = st.tabs(["📊 Ranking Drop Voltage", "📈 Grafik Tren Voltage (15 Menit)"])
 
     with tab1:
         if not df_dropped.empty:
@@ -240,7 +240,7 @@ else:
             st.subheader(f"Daftar Site Terdampak Voltage < {threshold_voltage} V")
             st.dataframe(summary, use_container_width=True, hide_index=True)
 
-            with st.expander("🔍 Lihat Rincian Log Per Jam (Data Mentah)"):
+            with st.expander("🔍 Lihat Rincian Log (Data Mentah)"):
                 df_detail = df_dropped.copy().sort_values(by="begin_time", ascending=False)
                 df_detail["Waktu (Lokal)"] = df_detail["begin_time"].dt.strftime("%Y-%m-%d %H:%M")
                 st.dataframe(
@@ -258,23 +258,45 @@ else:
             st.success(f"Kondisi optimal. Tidak ditemukan site dengan voltage di bawah {threshold_voltage} V.")
 
     with tab2:
-        st.subheader("Grafik Pergerakan Min, Avg, dan Max Voltage")
+        st.subheader("Grafik Pergerakan Voltage Per 15 Menit")
         
         dropped_sites = sorted(df_dropped["managed_element"].unique().tolist())
         all_sites = sorted(df_all["managed_element"].unique().tolist())
         site_list = dropped_sites + [s for s in all_sites if s not in dropped_sites]
 
-        selected_site = st.selectbox("Pilih Site / Managed Element:", options=site_list)
+        col_select_site, col_select_res = st.columns([3, 1])
+        with col_select_site:
+            selected_site = st.selectbox("Pilih Site / Managed Element:", options=site_list)
+        with col_select_res:
+            chart_interval = st.selectbox("Interval Waktu:", options=["15 Menit", "1 Jam", "Data Asli"])
 
         if selected_site:
-            df_site = df_all[df_all["managed_element"] == selected_site].sort_values(by="begin_time")
+            df_site = df_all[df_all["managed_element"] == selected_site].sort_values(by="begin_time").copy()
 
             if not df_site.empty:
-                chart_data = df_site.set_index("begin_time")[["min_voltage", "avg_voltage", "max_voltage"]]
-                chart_data.columns = ["Min Voltage", "Avg Voltage", "Max Voltage"]
+                df_site = df_site.set_index("begin_time")
                 
-                st.line_chart(chart_data, color=["#E53E3E", "#3182CE", "#38A169"])
+                # Agregasi data per 15 menit atau 1 jam
+                if chart_interval == "15 Menit":
+                    chart_df = df_site.resample("15min").agg({
+                        "min_voltage": "min",
+                        "avg_voltage": "mean",
+                        "max_voltage": "max"
+                    }).dropna(how="all")
+                elif chart_interval == "1 Jam":
+                    chart_df = df_site.resample("1h").agg({
+                        "min_voltage": "min",
+                        "avg_voltage": "mean",
+                        "max_voltage": "max"
+                    }).dropna(how="all")
+                else:
+                    chart_df = df_site[["min_voltage", "avg_voltage", "max_voltage"]]
+
+                chart_df.columns = ["Min Voltage (V)", "Avg Voltage (V)", "Max Voltage (V)"]
                 
+                st.line_chart(chart_df, color=["#E53E3E", "#3182CE", "#38A169"])
+                
+                # Statistik Ringkas Site
                 s_min = df_site["min_voltage"].min()
                 s_avg = df_site["avg_voltage"].mean()
                 s_max = df_site["max_voltage"].max()
